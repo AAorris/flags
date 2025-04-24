@@ -1,21 +1,39 @@
+import { createClient } from '@vercel/edge-config';
+import type { Adapter, Decide } from 'flags';
 import {
-  create,
-  VercelEdgeConfigInitDataProvider,
   type Node as HypertuneNode,
   type Value as HypertuneValue,
+  type ObjectValue,
+  VercelEdgeConfigInitDataProvider,
+  type create,
 } from 'hypertune';
-import { createClient } from '@vercel/edge-config';
-import type { Adapter } from 'flags';
 
-export type Context = NonNullable<HypertuneNode['props']['context']>;
+type _FieldQuery = Parameters<HypertuneNode['getFieldValue']>[1]['query'];
+type _Overrides = Parameters<HypertuneNode['setOverride']>[0];
+
+type FunctionOfRootNode = <T>(
+  getValue: (
+    rootNode: HypertuneNode,
+    props: Parameters<Decide<T, HypertuneEntities>>[0],
+  ) => T,
+) => Adapter<T, HypertuneEntities>;
+
+type FieldValueOfRootNode = <T extends HypertuneValue = HypertuneValue>(opts?: {
+  fallback: HypertuneValue;
+  fieldArguments: ObjectValue;
+  query: _FieldQuery;
+  key?: string;
+}) => Adapter<T, HypertuneEntities>;
 
 type HypertuneEntities = HypertuneValue;
-interface HypertuneAdapter {
-  fn: <T>(f: (rootNode: HypertuneNode) => T) => Adapter<T, HypertuneEntities>;
-  getHypertune: () => Promise<HypertuneNode>;
-}
 
-export function createHypertuneAdapter(options: {
+export type { HypertuneEntities, HypertuneValue };
+
+export function createHypertuneAdapter<
+  E extends HypertuneEntities,
+  T extends HypertuneNode,
+>(options: {
+  createSource: typeof create<T>;
   /** The Hypertune token */
   hypertuneToken: string;
   /** Optional Edge Config configuration */
@@ -23,13 +41,12 @@ export function createHypertuneAdapter(options: {
     connectionString: string;
     itemKey: string;
   };
-  environment?: string;
-}): HypertuneAdapter {
-  let hypertune: HypertuneNode | undefined;
+}) {
+  let _hypertune: T | undefined;
   let _initializePromise: Promise<void> | undefined;
 
   const initializeHypertune = async (): Promise<void> => {
-    hypertune = create({
+    _hypertune = options.createSource({
       token: options.hypertuneToken,
       options: {
         initDataProvider: options.edgeConfig
@@ -43,103 +60,59 @@ export function createHypertuneAdapter(options: {
       },
     });
 
-    _initializePromise = hypertune.initIfNeeded();
+    _initializePromise = _hypertune.initIfNeeded();
     await _initializePromise;
   };
 
   const getHypertune = async () => {
     await (_initializePromise ?? initializeHypertune());
-    if (!hypertune) {
+    if (!_hypertune) {
       throw new Error('Hypertune not initialized');
     }
-    return hypertune;
+    return _hypertune;
   };
 
-  // We can provide opinionated defaults for the default Hypertune settings,
-  // Override by providing an entities object including `environment`
-  function getEnvironment(): string {
-    if (options.environment) {
-      return options.environment;
-    }
-    if (process.env.VERCEL_ENV === 'production') {
-      return 'production';
-    }
-    return process.env.NODE_ENV ?? 'development';
-  }
-
-  const getContext = (entities?: HypertuneEntities): HypertuneEntities => {
-    const environment = getEnvironment();
-    const context = {
-      environment,
-    };
-    if (!entities) {
-      return context;
-    }
-    if (typeof entities === 'object' && entities !== null) {
-      return {
-        ...context,
-        ...entities,
-      };
-    }
-    // If entities is not an object, we'll pass it along as-is
-    return entities;
-  };
-
-  const adapter: HypertuneAdapter = {
-    getHypertune,
-    fn: (f) => {
-      return {
-        decide: async ({ key, entities }) => {
-          const hypertune = await getHypertune();
-          const rootNode = hypertune.getFieldNode('root', {
-            fieldArguments: {
-              context: getContext(entities),
-            },
-          });
-          return f(rootNode);
-        },
-      };
-    },
-  };
-}
-
-let defaultHypertuneAdapter: HypertuneAdapter | undefined;
-
-export function resetDefaultHypertuneAdapter() {
-  defaultHypertuneAdapter = undefined;
-}
-
-export function createDefaultHypertuneAdapter(): HypertuneAdapter {
-  if (defaultHypertuneAdapter) {
-    return defaultHypertuneAdapter;
-  }
-
-  const hypertuneToken = process.env.HYPERTUNE_TOKEN as string;
-  const edgeConfig = process.env.EDGE_CONFIG;
-  const edgeConfigItemKey = process.env.EDGE_CONFIG_HYPERTUNE_ITEM_KEY;
-
-  if (!(edgeConfig && edgeConfigItemKey)) {
-    defaultHypertuneAdapter = createHypertuneAdapter({
-      hypertuneToken,
-    });
-  } else {
-    defaultHypertuneAdapter = createHypertuneAdapter({
-      hypertuneToken,
-      edgeConfig: {
-        connectionString: edgeConfig,
-        itemKey: edgeConfigItemKey,
+  const getFieldValue: FieldValueOfRootNode = <
+    T extends HypertuneValue = HypertuneValue,
+  >(
+    opts: Parameters<FieldValueOfRootNode>[0],
+  ) => {
+    return {
+      decide: async (props) => {
+        const hypertune = await getHypertune();
+        const rootNode = hypertune.getFieldNode('root', {
+          fieldArguments: {
+            context: props.entities as E,
+          },
+        });
+        return rootNode.getFieldValue(opts?.key ?? props.key, {
+          fallback: (opts?.fallback ?? props.defaultValue) as HypertuneValue,
+          query: opts?.query,
+          fieldArguments: opts?.fieldArguments,
+        }) as T;
       },
-    });
-  }
+    };
+  };
 
-  return defaultHypertuneAdapter;
+  const fn: FunctionOfRootNode = (getValue) => {
+    return {
+      decide: async (props) => {
+        const hypertune = await getHypertune();
+        const rootNode = hypertune.getFieldNode('root', {
+          fieldArguments: {
+            context: props.entities as E,
+          },
+        });
+        return getValue(rootNode, props);
+      },
+    };
+  };
+
+  const adapter = {
+    getFieldValue,
+    getHypertune,
+    fn,
+  };
+
+  return adapter;
 }
-
-export const hypertuneAdapter: HypertuneAdapter = {
-  fn: (f) => {
-    return createDefaultHypertuneAdapter().fn(f);
-  },
-  getHypertune: () => {
-    return createDefaultHypertuneAdapter().getHypertune();
-  },
-};

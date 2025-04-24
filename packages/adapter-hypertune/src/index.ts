@@ -3,5 +3,6 @@ export {
   hypertuneAdapter,
   createHypertuneAdapter,
   resetDefaultHypertuneAdapter,
+  type HypertuneEntities,
+  type HypertuneValue,
 } from './adapter';
-export type { HypertuneContext } from './adapter';
