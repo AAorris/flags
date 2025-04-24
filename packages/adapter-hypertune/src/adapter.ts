@@ -1,118 +1,113 @@
+import type { Adapter, GenerousOption, Identify } from 'flags';
+import { flag } from 'flags/next';
 import { createClient } from '@vercel/edge-config';
-import type { Adapter, Decide } from 'flags';
-import {
-  type Node as HypertuneNode,
-  type Value as HypertuneValue,
-  type ObjectValue,
-  VercelEdgeConfigInitDataProvider,
-  type create,
-} from 'hypertune';
+import { VercelEdgeConfigInitDataProvider } from 'hypertune';
 
-type _FieldQuery = Parameters<HypertuneNode['getFieldValue']>[1]['query'];
-type _Overrides = Parameters<HypertuneNode['setOverride']>[0];
+type FlagDefinition = {
+  description?: string;
+  options?: Array<{ value: unknown; label: string }>;
+  origin?: string;
+};
 
-type FunctionOfRootNode = <T>(
-  getValue: (
-    rootNode: HypertuneNode,
-    props: Parameters<Decide<T, HypertuneEntities>>[0],
-  ) => T,
-) => Adapter<T, HypertuneEntities>;
-
-type FieldValueOfRootNode = <T extends HypertuneValue = HypertuneValue>(opts?: {
-  fallback: HypertuneValue;
-  fieldArguments: ObjectValue;
-  query: _FieldQuery;
-  key?: string;
-}) => Adapter<T, HypertuneEntities>;
-
-type HypertuneEntities = HypertuneValue;
-
-export type { HypertuneEntities, HypertuneValue };
-
-export function createHypertuneAdapter<
-  E extends HypertuneEntities,
-  T extends HypertuneNode,
->(options: {
-  createSource: typeof create<T>;
-  /** The Hypertune token */
-  hypertuneToken: string;
-  /** Optional Edge Config configuration */
-  edgeConfig?: {
-    connectionString: string;
-    itemKey: string;
+export const createHypertuneFlagFactory = <
+  TFlagValues extends Record<string, unknown>,
+  TContext extends Record<string, unknown>,
+>({
+  createSource,
+  flagFallbacks,
+  flagDefinitions,
+  identify,
+}: {
+  createSource: (options: {
+    token: string;
+    initDataProvider?: VercelEdgeConfigInitDataProvider;
+  }) => {
+    initIfNeeded: () => Promise<void>;
+    root: (args: { args: { context: TContext } }) => {
+      [K in keyof TFlagValues]: (args: {
+        fallback: TFlagValues[K];
+      }) => TFlagValues[K];
+    };
   };
-}) {
-  let _hypertune: T | undefined;
-  let _initializePromise: Promise<void> | undefined;
+  flagFallbacks: TFlagValues;
+  flagDefinitions: Record<keyof TFlagValues, FlagDefinition>;
+  identify: Identify<TContext>;
+}) => {
+  const token = process.env.NEXT_PUBLIC_HYPERTUNE_TOKEN as string;
+  const hasEdgeConfig = Boolean(
+    process.env.EXPERIMENTATION_CONFIG &&
+      process.env.EXPERIMENTATION_CONFIG_ITEM_KEY,
+  );
 
-  const initializeHypertune = async (): Promise<void> => {
-    _hypertune = options.createSource({
-      token: options.hypertuneToken,
-      options: {
-        initDataProvider: options.edgeConfig
-          ? new VercelEdgeConfigInitDataProvider({
-              edgeConfigClient: createClient(
-                options.edgeConfig.connectionString,
-              ),
-              itemKey: options.edgeConfig.itemKey,
-            })
-          : undefined,
-      },
-    });
+  let _source: ReturnType<typeof createSource> | undefined;
+  let _initIfNeededPromise: Promise<void> | undefined;
 
-    _initializePromise = _hypertune.initIfNeeded();
-    await _initializePromise;
-  };
-
-  const getHypertune = async () => {
-    await (_initializePromise ?? initializeHypertune());
-    if (!_hypertune) {
-      throw new Error('Hypertune not initialized');
+  const getSource = () => {
+    if (!_source) {
+      const initDataProvider = hasEdgeConfig
+        ? new VercelEdgeConfigInitDataProvider({
+            edgeConfigClient: createClient(
+              process.env.EXPERIMENTATION_CONFIG as string,
+            ),
+            itemKey: process.env.EXPERIMENTATION_CONFIG_ITEM_KEY as string,
+          })
+        : undefined;
+      _source = createSource({ token, initDataProvider });
     }
-    return _hypertune;
+    return _source;
   };
 
-  const getFieldValue: FieldValueOfRootNode = <
-    T extends HypertuneValue = HypertuneValue,
-  >(
-    opts: Parameters<FieldValueOfRootNode>[0],
-  ) => {
+  const hypertuneAdapter = <K extends keyof TFlagValues>(
+    key: K,
+  ): Adapter<TFlagValues[K], TContext> => {
     return {
-      decide: async (props) => {
-        const hypertune = await getHypertune();
-        const rootNode = hypertune.getFieldNode('root', {
-          fieldArguments: {
-            context: props.entities as E,
-          },
-        });
-        return rootNode.getFieldValue(opts?.key ?? props.key, {
-          fallback: (opts?.fallback ?? props.defaultValue) as HypertuneValue,
-          query: opts?.query,
-          fieldArguments: opts?.fieldArguments,
-        }) as T;
+      async decide({ entities, defaultValue }) {
+        try {
+          if (!entities) {
+            throw new Error(
+              `identify() is required to produce Context for Hypertune flag ${String(
+                key,
+              )}`,
+            );
+          }
+          if (typeof defaultValue === 'undefined') {
+            throw new Error(
+              `defaultValue is required for Hypertune flag ${String(key)}`,
+            );
+          }
+          const source = getSource();
+          if (!_initIfNeededPromise) {
+            _initIfNeededPromise = source.initIfNeeded();
+          }
+          await _initIfNeededPromise;
+          const hypertune = source.root({ args: { context: entities } });
+          const method = hypertune[key] as (args: {
+            fallback: TFlagValues[K];
+          }) => TFlagValues[K];
+          const result = method.call(hypertune, {
+            fallback: defaultValue,
+          });
+          return result;
+        } catch (error) {
+          console.error(error);
+          return defaultValue as TFlagValues[K];
+        }
       },
     };
   };
 
-  const fn: FunctionOfRootNode = (getValue) => {
-    return {
-      decide: async (props) => {
-        const hypertune = await getHypertune();
-        const rootNode = hypertune.getFieldNode('root', {
-          fieldArguments: {
-            context: props.entities as E,
-          },
-        });
-        return getValue(rootNode, props);
-      },
-    };
+  return <K extends keyof TFlagValues>(key: K) => {
+    const definition = flagDefinitions[key];
+    const flagOptions = definition.options as
+      | GenerousOption<TFlagValues[K]>[]
+      | undefined;
+    return flag<TFlagValues[K], TContext>({
+      key: String(key),
+      adapter: hypertuneAdapter(key),
+      defaultValue: flagFallbacks[key],
+      description: definition.description,
+      options: flagOptions,
+      identify,
+    });
   };
-
-  const adapter = {
-    getFieldValue,
-    getHypertune,
-    fn,
-  };
-
-  return adapter;
-}
+};
