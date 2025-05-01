@@ -5,7 +5,10 @@ import type {
   Identify,
 } from 'flags';
 import { createClient } from '@vercel/edge-config';
-import { VercelEdgeConfigInitDataProvider } from 'hypertune';
+import {
+  VercelEdgeConfigInitDataProvider,
+  type CreateOptions,
+} from 'hypertune';
 
 type FlagDefinition = {
   description?: string;
@@ -13,14 +16,16 @@ type FlagDefinition = {
   origin?: string;
 };
 
+interface CreateSourceOptions extends CreateOptions {
+  token: string;
+  initDataProvider?: VercelEdgeConfigInitDataProvider;
+}
+
 type AdapterArgs<
   TFlagValues extends Record<string, unknown>,
   TContext extends Record<string, unknown>,
 > = {
-  createSource: (options: {
-    token: string;
-    initDataProvider?: VercelEdgeConfigInitDataProvider;
-  }) => {
+  createSource: (options: CreateSourceOptions) => {
     initIfNeeded: () => Promise<void>;
     root: (args: { args: { context: TContext } }) => {
       [K in keyof TFlagValues]: (args: {
@@ -31,6 +36,7 @@ type AdapterArgs<
   flagFallbacks: TFlagValues;
   flagDefinitions: Record<keyof TFlagValues, FlagDefinition>;
   identify: Identify<TContext>;
+  createSourceOptions?: CreateOptions;
 };
 
 /**
@@ -68,25 +74,35 @@ export const createHypertuneAdapter = <
   flagFallbacks,
   flagDefinitions,
   identify,
+  createSourceOptions,
 }: AdapterArgs<TFlagValues, TContext>) => {
-  const token = process.env.NEXT_PUBLIC_HYPERTUNE_TOKEN as string;
-  const hasEdgeConfig = Boolean(
-    process.env.EXPERIMENTATION_CONFIG &&
-      process.env.EXPERIMENTATION_CONFIG_ITEM_KEY,
-  );
+  const token = (process.env.NEXT_PUBLIC_HYPERTUNE_TOKEN ??
+    process.env.HYPERTUNE_TOKEN) as string;
+
+  const hasEdgeConfig =
+    createSourceOptions?.initDataProvider ??
+    Boolean(
+      process.env.EXPERIMENTATION_CONFIG &&
+        process.env.EXPERIMENTATION_CONFIG_ITEM_KEY,
+    );
   let adapterSource: ReturnType<typeof createSource> | undefined;
 
   const getSource = (): ReturnType<typeof createSource> => {
     if (!adapterSource) {
       const initDataProvider = hasEdgeConfig
-        ? new VercelEdgeConfigInitDataProvider({
+        ? createSourceOptions?.initDataProvider ??
+          new VercelEdgeConfigInitDataProvider({
             edgeConfigClient: createClient(
               process.env.EXPERIMENTATION_CONFIG as string,
             ),
             itemKey: process.env.EXPERIMENTATION_CONFIG_ITEM_KEY as string,
           })
         : undefined;
-      adapterSource = createSource({ token, initDataProvider });
+      adapterSource = createSource({
+        ...createSourceOptions,
+        token,
+        initDataProvider: initDataProvider as VercelEdgeConfigInitDataProvider,
+      });
     }
     return adapterSource;
   };
@@ -96,33 +112,28 @@ export const createHypertuneAdapter = <
   ): Adapter<TFlagValues[K], TContext> => {
     return {
       async decide({ entities, defaultValue }) {
-        try {
-          if (!entities) {
-            throw new Error(
-              `identify() is required to produce Context for Hypertune flag ${String(
-                key,
-              )}`,
-            );
-          }
-          if (typeof defaultValue === 'undefined') {
-            throw new Error(
-              `defaultValue is required for Hypertune flag ${String(key)}`,
-            );
-          }
-          const source = getSource();
-          await source.initIfNeeded();
-          const hypertune = source.root({ args: { context: entities } });
-          const method = hypertune[key] as (args: {
-            fallback: TFlagValues[K];
-          }) => TFlagValues[K];
-          const result = method.call(hypertune, {
-            fallback: defaultValue,
-          });
-          return result;
-        } catch (error) {
-          console.error(error);
-          return defaultValue as TFlagValues[K];
+        if (!entities) {
+          throw new Error(
+            `identify() is required to produce Context for Hypertune flag ${String(
+              key,
+            )}`,
+          );
         }
+        if (typeof defaultValue === 'undefined') {
+          throw new Error(
+            `defaultValue is required for Hypertune flag ${String(key)}`,
+          );
+        }
+        const source = getSource();
+        await source.initIfNeeded();
+        const hypertune = source.root({ args: { context: entities } });
+        const method = hypertune[key] as (args: {
+          fallback: TFlagValues[K];
+        }) => TFlagValues[K];
+        const result = method.call(hypertune, {
+          fallback: defaultValue,
+        });
+        return result;
       },
     };
   };
