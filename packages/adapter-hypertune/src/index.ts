@@ -1,2 +1,2 @@
 export { getProviderData } from './provider';
-export { createHypertuneFlagFactory } from './adapter';
+export * from './adapter';
